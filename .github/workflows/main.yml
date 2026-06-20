@@ -31,9 +31,9 @@ on:
         required: false
         default: "3.12"
       sdl2_ref:
-        description: "Git ref of renpy/SDL2 to build"
+        description: "Git ref of renpy/SDL2 to build (this fork only has 'master' - it has no release tags)"
         required: false
-        default: "release-2.30.10"
+        default: "master"
       sdl2_image_ref:
         description: "Git tag of libsdl-org/SDL_image to build"
         required: false
@@ -45,7 +45,7 @@ on:
       sdl2_mixer_ref:
         description: "Git tag of libsdl-org/SDL_mixer to build"
         required: false
-        default: "master"
+        default: "release-2.8.0"
 
 jobs:
   build:
@@ -125,6 +125,14 @@ jobs:
       # We intentionally do NOT build our own zlib: iOS ships zlib as a
       # public system library (libz.tbd in the SDK), so everything below
       # links against that instead of bundling a duplicate static copy.
+      #
+      # -Wno-declaration-after-statement is added here too, but note: SDL2's
+      # own configure-derived EXTRA_CFLAGS appends
+      # -Werror=declaration-after-statement AFTER this on the final compile
+      # line, so this alone does NOT suppress it for SDL2 - see the targeted
+      # per-file patch in the "Build SDL2" step below for the fix that
+      # actually wins. It's left here anyway since it's harmless and may
+      # help other libraries in this list that don't re-add the -Werror.
       # --------------------------------------------------------------------
       - name: Write CMake iOS toolchain file
         run: |
@@ -279,17 +287,40 @@ jobs:
           cmake --install libvorbis-build
 
       # --------------------------------------------------------------------
-      # SDL2 itself. Source defaults to Ren'Py's own SDL2 fork; point
-      # sdl2_ref/repo at libsdl-org/SDL instead if you'd rather build vanilla
-      # upstream SDL2.
+      # SDL2 itself. Source defaults to Ren'Py's own SDL2 fork, which only
+      # has a "master" branch (no release tags exist on this fork - if you
+      # want to build vanilla upstream SDL2 with real tags instead, point
+      # sdl2_ref/the clone URL at libsdl-org/SDL).
+      #
+      # Two iOS/newer-SDK compatibility patches are applied to the freshly
+      # cloned source before configuring:
+      #
+      #   1. SDL_spinlock.c calls OSAtomicCompareAndSwap32Barrier(), which
+      #      lived in libkern/OSAtomic.h. Apple has fully removed that
+      #      header from newer iOS SDKs (confirmed gone in the 26.5 SDK this
+      #      workflow targets by default), causing an "undeclared function"
+      #      error. Fix: inject a drop-in replacement implemented with the
+      #      portable __sync_bool_compare_and_swap Clang/GCC builtin, which
+      #      doesn't depend on that header at all.
+      #
+      #   2. SDL_rwopsbundlesupport.m fails to compile under
+      #      -Werror=declaration-after-statement (which SDL's own
+      #      configure-derived EXTRA_CFLAGS adds unconditionally on Apple
+      #      targets). Passing -Wno-declaration-after-statement via
+      #      CMAKE_C_FLAGS does NOT win here: CMake places CMAKE_C_FLAGS
+      #      *before* each target's own EXTRA_CFLAGS on the compile line,
+      #      and Clang's "last flag wins" rule means SDL's own -Werror
+      #      always overrides it regardless of where the suppression flag
+      #      is injected from on the CMake side. The reliable fix is a
+      #      per-file #pragma, which applies after all command-line flags
+      #      and isn't subject to that ordering problem.
       # --------------------------------------------------------------------
       - name: Build SDL2
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$SDL2_REF" https://github.com/renpy/SDL2.git "$SRC/SDL2"
 
-          # SDL_spinlock.c: provide OSAtomicCompareAndSwap32Barrier via a
-          # Clang builtin, since newer iOS SDKs removed libkern/OSAtomic.h.
+          # --- Patch 1: SDL_spinlock.c / OSAtomicCompareAndSwap32Barrier ---
           cat > "$SRC/SDL2/src/atomic/sdl2_ios26_osatomic_compat.h" << 'EOF'
           #ifndef SDL2_IOS26_OSATOMIC_COMPAT_H
           #define SDL2_IOS26_OSATOMIC_COMPAT_H
@@ -307,16 +338,20 @@ jobs:
           ' "$SPINLOCK_C"
           fi
 
-          # SDL_rwopsbundlesupport.m: SDL's own -Werror=declaration-after-statement
-          # always wins over any CMAKE_C_FLAGS suppression attempt (CMake puts
-          # CMAKE_C_FLAGS before each target's EXTRA_CFLAGS), so patch the line.
+          # --- Patch 2: SDL_rwopsbundlesupport.m / declaration-after-statement ---
           RWOPS_M="$SRC/SDL2/src/file/cocoa/SDL_rwopsbundlesupport.m"
           if [ -f "$RWOPS_M" ]; then
-            sed -i '' \
-              -e 's/NSFileManager\* file_manager = \[NSFileManager defaultManager\];/NSFileManager* file_manager;\n    file_manager = [NSFileManager defaultManager];/' \
-              "$RWOPS_M"
-            echo "Patched SDL_rwopsbundlesupport.m, context:"
-            grep -n -A2 -B2 "file_manager" "$RWOPS_M"
+            echo "--- SDL_rwopsbundlesupport.m before patch ---"
+            cat -n "$RWOPS_M"
+            if ! grep -q 'clang diagnostic ignored "-Wdeclaration-after-statement"' "$RWOPS_M"; then
+              sed -i '' '1i\
+          #pragma clang diagnostic push\
+          #pragma clang diagnostic ignored "-Wdeclaration-after-statement"
+          ' "$RWOPS_M"
+              printf '\n#pragma clang diagnostic pop\n' >> "$RWOPS_M"
+            fi
+            echo "--- SDL_rwopsbundlesupport.m after patch ---"
+            cat -n "$RWOPS_M"
           fi
 
           cmake -S "$SRC/SDL2" -B "$SRC/SDL2-build" -G Ninja \
@@ -327,6 +362,21 @@ jobs:
             -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF
           cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2-build"
+
+      - name: Build SDL2_image
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SDL2_IMAGE_REF" https://github.com/libsdl-org/SDL_image.git "$SRC/SDL2_image"
+          cmake -S "$SRC/SDL2_image" -B "$SRC/SDL2_image-build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
+            -DBUILD_SHARED_LIBS=OFF -DSDL2IMAGE_VENDORED=OFF -DSDL2IMAGE_SAMPLES=OFF \
+            -DSDL2IMAGE_AVIF=OFF -DSDL2IMAGE_JXL=OFF -DSDL2IMAGE_TIF=OFF
+          cmake --build "$SRC/SDL2_image-build" --parallel "$JOBS"
+          cmake --install "$SRC/SDL2_image-build"
 
       - name: Build SDL2_ttf
         run: |
