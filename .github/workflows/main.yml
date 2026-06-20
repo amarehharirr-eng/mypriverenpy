@@ -157,8 +157,8 @@ jobs:
 
           set(CMAKE_C_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden")
           set(CMAKE_CXX_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
-          set(CMAKE_OBJC_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
-          set(CMAKE_OBJCXX_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
+          set(CMAKE_OBJC_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden -Wno-declaration-after-statement")
+          set(CMAKE_OBJCXX_FLAGS_INIT "${CMAKE_OBJC_FLAGS_INIT}")
 
           set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
@@ -289,6 +289,24 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$SDL2_REF" https://github.com/renpy/SDL2.git "$SRC/SDL2"
+          cat > "$SRC/SDL2/src/atomic/sdl2_ios26_osatomic_compat.h" << 'EOF'
+          #ifndef SDL2_IOS26_OSATOMIC_COMPAT_H
+          #define SDL2_IOS26_OSATOMIC_COMPAT_H
+          #if defined(__APPLE__) && !defined(SDL2_IOS26_OSATOMIC_COMPAT_DISABLE)
+          static __inline__ int OSAtomicCompareAndSwap32Barrier(int oldValue, int newValue, volatile int *theValue) {
+              return __sync_bool_compare_and_swap(theValue, oldValue, newValue);
+          }
+          #endif
+          #endif
+          EOF
+
+          SPINLOCK_C="$SRC/SDL2/src/atomic/SDL_spinlock.c"
+          if ! grep -q sdl2_ios26_osatomic_compat.h "$SPINLOCK_C"; then
+            sed -i '' '1i\
+          #include "sdl2_ios26_osatomic_compat.h"
+          ' "$SPINLOCK_C"
+          fi
+
           cmake -S "$SRC/SDL2" -B "$SRC/SDL2-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
