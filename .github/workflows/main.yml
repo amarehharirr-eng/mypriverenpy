@@ -258,8 +258,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DBUILD_TESTING=OFF \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_TESTING=OFF
           cmake --build libogg-build --parallel "$JOBS"
           cmake --install libogg-build
 
