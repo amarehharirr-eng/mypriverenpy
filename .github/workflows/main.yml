@@ -155,10 +155,8 @@ jobs:
           set(CMAKE_C_COMPILER /usr/bin/clang)
           set(CMAKE_CXX_COMPILER /usr/bin/clang++)
 
-          set(CMAKE_C_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden")
+          set(CMAKE_C_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden -Wno-declaration-after-statement")
           set(CMAKE_CXX_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
-          set(CMAKE_OBJC_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden -Wno-declaration-after-statement")
-          set(CMAKE_OBJCXX_FLAGS_INIT "${CMAKE_OBJC_FLAGS_INIT}")
 
           set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
