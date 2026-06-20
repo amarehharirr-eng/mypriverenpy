@@ -310,6 +310,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DCMAKE_C_FLAGS="-Wno-declaration-after-statement" \
             -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF
           cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2-build"
