@@ -1,260 +1,414 @@
-# ============================================================
-#  Ren'Py iOS Library Builder  (arm64 / real device only)
-#  Builds: libSDL2.a, libSDL2_image.a, libSDL2_ttf.a,
-#          libSDL2_mixer.a, libpython3.12.a and companions
-#  SDK:    iPhoneOS18.4.sdk from xybp888/iOS-SDKs
-# ============================================================
+name: Build Ren'Py iOS Toolchain
 
-name: Build Ren'Py iOS Libraries (arm64)
+# Builds static libraries for SDL2, SDL2_image, SDL2_ttf, SDL2_mixer (plus their
+# codec dependencies: libpng, libjpeg-turbo, libwebp, freetype, libogg, libvorbis)
+# and Python 3.12 for iOS (arm64, real devices), then zips the whole toolchain and
+# uploads it as a workflow artifact.
+#
+# This must run on a macOS runner because the final link step needs Apple's clang/ld
+# and the iOS SDK frameworks. The SDK itself is pulled from xybp888/iOS-SDKs instead
+# of relying on whatever happens to ship with the runner's pre-installed Xcode, so you
+# can target a newer iOS SDK (e.g. iOS 26.x) than the runner's Xcode otherwise knows
+# about — clang accepts any directory that looks like an SDK via -isysroot, it doesn't
+# need to be "registered" with Xcode.
+#
+# Trigger manually from the Actions tab (workflow_dispatch). All inputs have sane
+# defaults, so the first run can just hit "Run workflow" with nothing changed.
 
 on:
   workflow_dispatch:
     inputs:
       ios_sdk_version:
-        description: "iOS SDK version (from xybp888/iOS-SDKs, e.g. 18.4)"
+        description: "SDK folder version from xybp888/iOS-SDKs, e.g. 26.5, 26.4, 18.5 (check the repo's file list for valid values)"
         required: false
-        default: "18.4"
-
-env:
-  RENPY_BUILD_REF: "master"
-  IOS_SDK_VERSION: ${{ github.event.inputs.ios_sdk_version || '18.4' }}
-
-  # ── Hardcoded source versions matching renpy-build/master ──
-  # Check tasks/sdl2*.py in renpy-build if you ever update the ref.
-  SDL2_VER: "2.0.20"
-  SDL2_IMAGE_VER: "2.6.2"
-  SDL2_TTF_VER: "2.20.2"
-  SDL2_MIXER_VER: "2.6.3"
+        default: "26.5"
+      ios_deployment_target:
+        description: "Minimum iOS version the libraries will support"
+        required: false
+        default: "13.0"
+      python_branch:
+        description: "Branch of beeware/Python-Apple-support to build (Python version)"
+        required: false
+        default: "3.12"
+      sdl2_ref:
+        description: "Git ref of renpy/SDL2 to build"
+        required: false
+        default: "master"
+      sdl2_image_ref:
+        description: "Git tag of libsdl-org/SDL_image to build"
+        required: false
+        default: "release-2.8.2"
+      sdl2_ttf_ref:
+        description: "Git tag of libsdl-org/SDL_ttf to build"
+        required: false
+        default: "release-2.22.0"
+      sdl2_mixer_ref:
+        description: "Git tag of libsdl-org/SDL_mixer to build"
+        required: false
+        default: "release-2.8.0"
 
 jobs:
   build:
-    name: "Build ios/arm64"
-    runs-on: macos-14            # Apple Silicon — required for iOS cross-compile
+    # macos-latest gets you a recent Xcode automatically. Pin to e.g. macos-15 instead
+    # if you want a reproducible runner image once you've confirmed it's available to
+    # your account/org.
+    runs-on: macos-latest
     timeout-minutes: 180
 
+    env:
+      IOS_SDK_VERSION: ${{ github.event.inputs.ios_sdk_version || '26.5' }}
+      IOS_DEPLOYMENT_TARGET: ${{ github.event.inputs.ios_deployment_target || '13.0' }}
+      PYTHON_BRANCH: ${{ github.event.inputs.python_branch || '3.12' }}
+      SDL2_REF: ${{ github.event.inputs.sdl2_ref || 'master' }}
+      SDL2_IMAGE_REF: ${{ github.event.inputs.sdl2_image_ref || 'release-2.8.2' }}
+      SDL2_TTF_REF: ${{ github.event.inputs.sdl2_ttf_ref || 'release-2.22.0' }}
+      SDL2_MIXER_REF: ${{ github.event.inputs.sdl2_mixer_ref || 'release-2.8.0' }}
+      PREFIX: ${{ github.workspace }}/build/ios-arm64
+      SRC: ${{ github.workspace }}/build/src
+
     steps:
-      # ── 1. Checkout renpy-build ──────────────────────────────
-      - name: Checkout renpy-build
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          repository: renpy/renpy-build
-          ref: ${{ env.RENPY_BUILD_REF }}
-          path: renpy-build
 
-      # ── 2. Python 3.12 (host tooling) ───────────────────────
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # ── 3. Homebrew deps ─────────────────────────────────────
-      - name: Install build dependencies
+      - name: Install build tools
         run: |
-          brew update
-          brew install \
-            autoconf automake libtool pkg-config \
-            nasm yasm cmake ninja wget
+          set -euo pipefail
+          brew install cmake ninja
 
-      # ── 4. iOS SDK (sparse clone – only the one folder) ──────
-      - name: Fetch iOS SDK from xybp888/iOS-SDKs
+      - name: Show toolchain versions
         run: |
-          SDK_NAME="iPhoneOS${IOS_SDK_VERSION}.sdk"
-          echo "Fetching $SDK_NAME …"
+          set -euo pipefail
+          xcodebuild -version
+          echo "Bundled iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo 'none found')"
+          clang --version
+          cmake --version
+          ninja --version
 
-          git clone \
-            --depth 1 \
-            --filter=blob:none \
-            --sparse \
-            https://github.com/xybp888/iOS-SDKs.git \
-            ios-sdks-sparse
-
-          cd ios-sdks-sparse
-          git sparse-checkout set "$SDK_NAME"
-          cd ..
-
-          # Stage it where renpy-build can find it
-          mkdir -p sdk-staging
-          cp -r "ios-sdks-sparse/$SDK_NAME" "sdk-staging/$SDK_NAME"
-
-          # Also drop it into the active Xcode platform so xcrun resolves it
-          XCODE_SDKS="$(xcode-select -p)/Platforms/iPhoneOS.platform/Developer/SDKs"
-          sudo mkdir -p "$XCODE_SDKS"
-          sudo cp -r "sdk-staging/$SDK_NAME" "$XCODE_SDKS/$SDK_NAME" || true
-
-          echo "IOS_SDK_PATH=$PWD/sdk-staging/$SDK_NAME" >> "$GITHUB_ENV"
-          echo "SDK_NAME=$SDK_NAME"                      >> "$GITHUB_ENV"
-
-      # ── 5. Download all source tarballs ──────────────────────
-      # renpy-build reads tarballs from ./tars/ — we pre-populate
-      # them with the exact versions it expects.
-      - name: Download SDL2 source tarballs
-        working-directory: renpy-build
+      - name: Prepare build directories
         run: |
-          mkdir -p tars
-          cd tars
+          set -euo pipefail
+          mkdir -p "$PREFIX" "$SRC"
+          echo "JOBS=$(sysctl -n hw.ncpu)" >> "$GITHUB_ENV"
 
-          BASE_SDL="https://github.com/libsdl-org"
-
-          download() {
-            local file="$1"; local url="$2"
-            if [ -f "$file" ]; then
-              echo "  already present: $file"
-            else
-              echo "  downloading: $file"
-              curl -fsSL --retry 3 -o "$file" "$url"
-            fi
-          }
-
-          # SDL2 — note the older release URL format
-          download "SDL2-${SDL2_VER}.tar.gz" \
-            "${BASE_SDL}/SDL/releases/download/release-${SDL2_VER}/SDL2-${SDL2_VER}.tar.gz"
-
-          # SDL2_image
-          download "SDL2_image-${SDL2_IMAGE_VER}.tar.gz" \
-            "${BASE_SDL}/SDL_image/releases/download/release-${SDL2_IMAGE_VER}/SDL2_image-${SDL2_IMAGE_VER}.tar.gz"
-
-          # SDL2_ttf
-          download "SDL2_ttf-${SDL2_TTF_VER}.tar.gz" \
-            "${BASE_SDL}/SDL_ttf/releases/download/release-${SDL2_TTF_VER}/SDL2_ttf-${SDL2_TTF_VER}.tar.gz"
-
-          # SDL2_mixer
-          download "SDL2_mixer-${SDL2_MIXER_VER}.tar.gz" \
-            "${BASE_SDL}/SDL_mixer/releases/download/release-${SDL2_MIXER_VER}/SDL2_mixer-${SDL2_MIXER_VER}.tar.gz"
-
-          echo ""
-          echo "=== tars/ contents ==="
-          ls -lh
-
-      # ── 6. Prepare Python venv + build tools ─────────────────
-      - name: Prepare build environment (venv + cython)
-        working-directory: renpy-build
+      # --------------------------------------------------------------------
+      # Fetch the iOS SDK from xybp888/iOS-SDKs. We sparse-checkout just the
+      # one SDK folder we need instead of cloning the whole (huge) repo,
+      # since it contains every SDK version from iOS 9 through 26.x.
+      # --------------------------------------------------------------------
+      - name: Download iOS SDK from xybp888/iOS-SDKs
         run: |
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-          pip install cython setuptools wheel requests
+          set -euo pipefail
+          SDK_FOLDER="iPhoneOS${IOS_SDK_VERSION}.sdk"
+          git clone --filter=blob:none --no-checkout --depth 1 \
+            --single-branch --branch master \
+            https://github.com/xybp888/iOS-SDKs.git "$SRC/iOS-SDKs"
+          cd "$SRC/iOS-SDKs"
+          git sparse-checkout init --cone
+          git sparse-checkout set "$SDK_FOLDER"
+          git checkout master
+          SDK_DIR="$SRC/iOS-SDKs/$SDK_FOLDER"
+          if [ ! -d "$SDK_DIR/usr/include" ]; then
+            echo "::error::Could not find $SDK_FOLDER in xybp888/iOS-SDKs. Check the repo's"
+            echo "::error::file list for the exact folder name and set ios_sdk_version to match."
+            exit 1
+          fi
+          echo "SDKROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "Using SDK: $SDK_DIR"
 
-      # ── 7. Run renpy-build prepare ───────────────────────────
-      # prepare.sh downloads additional tarballs (Python, FreeType, etc.)
-      # and sets up the ndk/toolchain wrappers.
-      - name: Run prepare.sh
-        working-directory: renpy-build
+      # --------------------------------------------------------------------
+      # A small CMake toolchain file that cross-compiles for iOS arm64
+      # (real devices) using the SDK we just downloaded. Apple's clang
+      # accepts an arbitrary -isysroot path, so it doesn't matter that this
+      # SDK isn't one Xcode itself knows about.
+      #
+      # We intentionally do NOT build our own zlib: iOS ships zlib as a
+      # public system library (libz.tbd in the SDK), so everything below
+      # links against that instead of bundling a duplicate static copy.
+      # --------------------------------------------------------------------
+      - name: Write CMake iOS toolchain file
         run: |
-          source venv/bin/activate
-          # prepare.sh may prompt; we answer non-interactively
-          export DEBIAN_FRONTEND=noninteractive
-          bash prepare.sh || true   # 'true' because it may exit non-zero
-                                    # on macOS for Linux-only steps
+          set -euo pipefail
+          cat > "$GITHUB_WORKSPACE/build/ios.toolchain.cmake" << 'EOF'
+          if(NOT DEFINED SDKROOT)
+            if(DEFINED ENV{SDKROOT})
+              set(SDKROOT "$ENV{SDKROOT}")
+            else()
+              message(FATAL_ERROR "SDKROOT is not set")
+            endif()
+          endif()
 
-      # ── 8. Build ─────────────────────────────────────────────
-      - name: Build ios/arm64
-        working-directory: renpy-build
-        env:
-          RENPY_IOS_SDK: ${{ env.IOS_SDK_PATH }}
+          if(NOT DEFINED DEPLOYMENT_TARGET)
+            if(DEFINED ENV{IOS_DEPLOYMENT_TARGET})
+              set(DEPLOYMENT_TARGET "$ENV{IOS_DEPLOYMENT_TARGET}")
+            else()
+              set(DEPLOYMENT_TARGET "13.0")
+            endif()
+          endif()
+
+          set(CMAKE_SYSTEM_NAME iOS)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "" FORCE)
+          set(CMAKE_OSX_SYSROOT "${SDKROOT}" CACHE PATH "" FORCE)
+          set(CMAKE_OSX_DEPLOYMENT_TARGET "${DEPLOYMENT_TARGET}" CACHE STRING "" FORCE)
+
+          set(CMAKE_C_COMPILER /usr/bin/clang)
+          set(CMAKE_CXX_COMPILER /usr/bin/clang++)
+
+          set(CMAKE_C_FLAGS_INIT "-isysroot ${SDKROOT} -miphoneos-version-min=${DEPLOYMENT_TARGET} -fvisibility=hidden")
+          set(CMAKE_CXX_FLAGS_INIT "${CMAKE_C_FLAGS_INIT}")
+
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+          set(CMAKE_FIND_ROOT_PATH "${SDKROOT}" "${CMAKE_INSTALL_PREFIX}")
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+          EOF
+          cat "$GITHUB_WORKSPACE/build/ios.toolchain.cmake"
+
+      # --------------------------------------------------------------------
+      # libpng (needs the system zlib)
+      # --------------------------------------------------------------------
+      - name: Build libpng
         run: |
-          source venv/bin/activate
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o libpng.tar.gz "https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.44.tar.gz"
+          mkdir -p libpng-src && tar xzf libpng.tar.gz -C libpng-src --strip-components=1
+          cmake -S libpng-src -B libpng-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_TESTS=OFF -DPNG_TOOLS=OFF
+          cmake --build libpng-build --parallel "$JOBS"
+          cmake --install libpng-build
 
-          # Expose our custom SDK to the build system
-          export RENPY_IOS_SDK="$IOS_SDK_PATH"
-          export SDKROOT="$IOS_SDK_PATH"
-
-          ./build.sh \
-            --platform ios \
-            --arch arm64 \
-            --python 3
-
-      # ── 9. Collect .a files ───────────────────────────────────
-      - name: Collect built libraries
+      # --------------------------------------------------------------------
+      # libjpeg-turbo (SIMD disabled for build reliability across versions;
+      # drop -DWITH_SIMD=OFF if you want to chase the extra performance)
+      # --------------------------------------------------------------------
+      - name: Build libjpeg-turbo
         run: |
-          mkdir -p output/lib output/include
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o libjpeg-turbo.tar.gz "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.0.4.tar.gz"
+          mkdir -p libjpeg-turbo-src && tar xzf libjpeg-turbo.tar.gz -C libjpeg-turbo-src --strip-components=1
+          cmake -S libjpeg-turbo-src -B libjpeg-turbo-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DWITH_SIMD=OFF
+          cmake --build libjpeg-turbo-build --parallel "$JOBS"
+          cmake --install libjpeg-turbo-build
 
-          # renpy-build installs to tmp/install/ios-arm64/
-          INSTALL_BASE="renpy-build/tmp/install/ios-arm64"
+      # --------------------------------------------------------------------
+      # libwebp
+      # --------------------------------------------------------------------
+      - name: Build libwebp
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o libwebp.tar.gz "https://github.com/webmproject/libwebp/archive/refs/tags/v1.4.0.tar.gz"
+          mkdir -p libwebp-src && tar xzf libwebp.tar.gz -C libwebp-src --strip-components=1
+          cmake -S libwebp-src -B libwebp-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
+            -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
+            -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF
+          cmake --build libwebp-build --parallel "$JOBS"
+          cmake --install libwebp-build
 
-          if [ -d "$INSTALL_BASE/lib" ]; then
-            cp "$INSTALL_BASE"/lib/*.a output/lib/ 2>/dev/null || true
+      # --------------------------------------------------------------------
+      # freetype (needed by SDL2_ttf). Harfbuzz/Brotli/BZip2 turned off to
+      # avoid pulling in even more dependencies; PNG/zlib stay on since we
+      # already have both.
+      # --------------------------------------------------------------------
+      - name: Build freetype
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o freetype.tar.gz "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.gz"
+          mkdir -p freetype-src && tar xzf freetype.tar.gz -C freetype-src --strip-components=1
+          cmake -S freetype-src -B freetype-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_BZIP2=ON
+          cmake --build freetype-build --parallel "$JOBS"
+          cmake --install freetype-build
+
+      # --------------------------------------------------------------------
+      # libogg + libvorbis (needed by SDL2_mixer for .ogg playback)
+      # --------------------------------------------------------------------
+      - name: Build libogg
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o libogg.tar.gz "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.gz"
+          mkdir -p libogg-src && tar xzf libogg.tar.gz -C libogg-src --strip-components=1
+          cmake -S libogg-src -B libogg-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DBUILD_TESTING=OFF
+          cmake --build libogg-build --parallel "$JOBS"
+          cmake --install libogg-build
+
+      - name: Build libvorbis
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          curl -fL -o libvorbis.tar.gz "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.gz"
+          mkdir -p libvorbis-src && tar xzf libvorbis.tar.gz -C libvorbis-src --strip-components=1
+          cmake -S libvorbis-src -B libvorbis-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DOGG_INCLUDE_DIR="$PREFIX/include" -DOGG_LIBRARY="$PREFIX/lib/libogg.a"
+          cmake --build libvorbis-build --parallel "$JOBS"
+          cmake --install libvorbis-build
+
+      # --------------------------------------------------------------------
+      # SDL2 itself. Source defaults to Ren'Py's own SDL2 fork; point
+      # sdl2_ref/repo at libsdl-org/SDL instead if you'd rather build vanilla
+      # upstream SDL2.
+      # --------------------------------------------------------------------
+      - name: Build SDL2
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SDL2_REF" https://github.com/renpy/SDL2.git "$SRC/SDL2"
+          cmake -S "$SRC/SDL2" -B "$SRC/SDL2-build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF
+          cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
+          cmake --install "$SRC/SDL2-build"
+
+      - name: Build SDL2_image
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SDL2_IMAGE_REF" https://github.com/libsdl-org/SDL_image.git "$SRC/SDL2_image"
+          cmake -S "$SRC/SDL2_image" -B "$SRC/SDL2_image-build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
+            -DBUILD_SHARED_LIBS=OFF -DSDL2IMAGE_VENDORED=OFF -DSDL2IMAGE_SAMPLES=OFF \
+            -DSDL2IMAGE_AVIF=OFF -DSDL2IMAGE_JXL=OFF -DSDL2IMAGE_TIF=OFF
+          cmake --build "$SRC/SDL2_image-build" --parallel "$JOBS"
+          cmake --install "$SRC/SDL2_image-build"
+
+      - name: Build SDL2_ttf
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SDL2_TTF_REF" https://github.com/libsdl-org/SDL_ttf.git "$SRC/SDL2_ttf"
+          cmake -S "$SRC/SDL2_ttf" -B "$SRC/SDL2_ttf-build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
+            -DBUILD_SHARED_LIBS=OFF -DSDL2TTF_VENDORED=OFF -DSDL2TTF_HARFBUZZ=OFF -DSDL2TTF_SAMPLES=OFF
+          cmake --build "$SRC/SDL2_ttf-build" --parallel "$JOBS"
+          cmake --install "$SRC/SDL2_ttf-build"
+
+      - name: Build SDL2_mixer
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
+          cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
+            -DBUILD_SHARED_LIBS=OFF -DSDL2MIXER_VENDORED=OFF -DSDL2MIXER_SAMPLES=OFF \
+            -DSDL2MIXER_MOD=OFF -DSDL2MIXER_MIDI=OFF -DSDL2MIXER_OPUS=OFF \
+            -DSDL2MIXER_FLAC=ON -DSDL2MIXER_MP3=ON -DSDL2MIXER_VORBIS=VORBISFILE
+          cmake --build "$SRC/SDL2_mixer-build" --parallel "$JOBS"
+          cmake --install "$SRC/SDL2_mixer-build"
+
+      # --------------------------------------------------------------------
+      # Python 3.12 for iOS. CPython's own iOS support (PEP 730) only landed
+      # in 3.13, but BeeWare backported it to 3.9-3.12, and their
+      # Python-Apple-support project is the proven, maintained way to get a
+      # working static interpreter + stdlib for iOS. `make iOS` produces a
+      # Python.xcframework containing arm64-device and arm64-simulator
+      # slices, which is the modern Apple-recommended way to hand a Python
+      # build to an Xcode project.
+      # --------------------------------------------------------------------
+      - name: Build Python (BeeWare Python-Apple-support)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$PYTHON_BRANCH" \
+            https://github.com/beeware/Python-Apple-support.git "$SRC/Python-Apple-support"
+          cd "$SRC/Python-Apple-support"
+          make iOS
+          XCFRAMEWORK="$(find . -maxdepth 4 -iname 'Python.xcframework' -print -quit)"
+          if [ -z "$XCFRAMEWORK" ]; then
+            echo "::error::Python.xcframework was not produced - check the build log above."
+            exit 1
+          fi
+          echo "PYTHON_XCFRAMEWORK=$SRC/Python-Apple-support/${XCFRAMEWORK#./}" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------------------------
+      # Collect every static library + the Python build into one folder and
+      # zip it up for the artifact.
+      # --------------------------------------------------------------------
+      - name: Package toolchain
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/renpy-ios-toolchain"
+          mkdir -p "$OUT/lib" "$OUT/include" "$OUT/python"
+
+          # Only static libraries - never ship the throwaway .dylibs some of
+          # these CMake builds produce alongside the static archives.
+          find "$PREFIX/lib" -name "*.a" -exec cp {} "$OUT/lib/" \;
+          cp -R "$PREFIX/include/." "$OUT/include/"
+          cp -R "$PYTHON_XCFRAMEWORK" "$OUT/python/Python.xcframework"
+
+          # Pull a flat libpython3.12.a out of the xcframework's device slice
+          # too, for tooling that expects a plain static lib rather than a
+          # framework bundle.
+          DEVICE_SLICE="$(find "$OUT/python/Python.xcframework" -maxdepth 1 -iname 'ios-arm64' -print -quit)"
+          if [ -n "$DEVICE_SLICE" ]; then
+            find "$DEVICE_SLICE" -iname "libpython*.a" -exec cp {} "$OUT/lib/" \;
           fi
 
-          # Fall back: find all .a files anywhere under tmp/
-          find renpy-build/tmp -name "*.a" | while read f; do
-            dest="output/lib/$(basename $f)"
-            [ -f "$dest" ] || cp "$f" "$dest"
-          done
+          cat > "$OUT/BUILD_INFO.txt" << INFO
+          Ren'Py iOS toolchain
+          Built: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          iOS SDK: $IOS_SDK_VERSION (from xybp888/iOS-SDKs)
+          Deployment target: iOS $IOS_DEPLOYMENT_TARGET, arm64 device only
+          SDL2: renpy/SDL2 @ $SDL2_REF
+          SDL2_image: libsdl-org/SDL_image @ $SDL2_IMAGE_REF
+          SDL2_ttf: libsdl-org/SDL_ttf @ $SDL2_TTF_REF
+          SDL2_mixer: libsdl-org/SDL_mixer @ $SDL2_MIXER_REF
+          Python: beeware/Python-Apple-support @ $PYTHON_BRANCH
+          zlib: system (libz.tbd from the iOS SDK, not rebuilt)
+          INFO
 
-          # Headers
-          [ -d "$INSTALL_BASE/include" ] && \
-            cp -r "$INSTALL_BASE/include/." output/include/ || true
+          cd "$GITHUB_WORKSPACE"
+          zip -r renpy-ios-toolchain.zip renpy-ios-toolchain
+          echo "Zip contents:"
+          unzip -l renpy-ios-toolchain.zip | tail -n +2
 
-          echo ""
-          echo "=== Built libraries ==="
-          ls -lh output/lib/*.a 2>/dev/null || echo "(no .a files found — check build log)"
-
-          echo ""
-          echo "=== Key libraries check ==="
-          for lib in libSDL2.a libSDL2_image.a libSDL2_ttf.a libSDL2_mixer.a libpython3.12.a; do
-            if [ -f "output/lib/$lib" ]; then
-              echo "  ✓ $lib  ($(du -sh output/lib/$lib | cut -f1))"
-            else
-              echo "  ✗ $lib  NOT FOUND"
-            fi
-          done
-
-      # ── 10. Zip everything ────────────────────────────────────
-      - name: Create zip archive
-        run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          ZIP="renpy-ios-arm64-libs-${TIMESTAMP}.zip"
-
-          # Write a readme
-          cat > output/README.txt << 'EOF'
-          Ren'Py iOS arm64 Libraries
-          ==========================
-          Platform : iOS arm64 (real device)
-          Builder  : GitHub Actions / renpy-build master
-          SDK      : xybp888/iOS-SDKs
-
-          Usage
-          -----
-          Add the .a files to your Xcode project under
-          Build Phases → Link Binary With Libraries.
-          Set the Header Search Paths to point at include/.
-
-          Key libraries
-          -------------
-          libSDL2.a           — core SDL2
-          libSDL2_image.a     — PNG/JPG/WebP image loading
-          libSDL2_ttf.a       — TrueType font rendering
-          libSDL2_mixer.a     — audio / music playback
-          libpython3.12.a     — embedded Python 3.12
-          libfreetype.a       — FreeType font engine
-          libpng.a            — PNG support
-          libjpeg.a           — JPEG support
-          libvorbis.a / libogg.a — Ogg Vorbis audio
-          libopus.a / libopusfile.a — Opus audio
-          libwebp.a           — WebP image support
-          libz.a              — zlib compression
-          EOF
-
-          zip -r "$ZIP" output/
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
-          echo ""
-          echo "Archive: $ZIP  ($(du -sh $ZIP | cut -f1))"
-
-      # ── 11. Upload artifact ───────────────────────────────────
-      - name: Upload zip as artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: renpy-ios-arm64-libs
-          path: ${{ env.ZIP }}
-          retention-days: 30
-
-      - name: Summary
-        run: |
-          echo "## Build complete! 🎉" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Download the zip from **Actions → this run → Artifacts → renpy-ios-arm64-libs**" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Libraries built" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-          ls output/lib/*.a 2>/dev/null | xargs -I{} basename {} >> "$GITHUB_STEP_SUMMARY" || echo "(check build log)" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          name: renpy-ios-toolchain
+          path: renpy-ios-toolchain.zip
+          if-no-files-found: error
+          retention-days: 14
