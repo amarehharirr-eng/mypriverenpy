@@ -6,11 +6,11 @@ name: Build Ren'Py iOS Toolchain
 # uploads it as a workflow artifact.
 #
 # This must run on a macOS runner because the final link step needs Apple's clang/ld
-# and the iOS SDK frameworks. The SDK itself is pulled from xybp888/iOS-SDKs instead
-# of relying on whatever happens to ship with the runner's pre-installed Xcode, so you
-# can target a newer iOS SDK (e.g. iOS 26.x) than the runner's Xcode otherwise knows
-# about — clang accepts any directory that looks like an SDK via -isysroot, it doesn't
-# need to be "registered" with Xcode.
+# and the iOS SDK frameworks. It pins the runner to Xcode 16.4 (GitHub's default Xcode
+# on macos-latest at time of writing) and uses that Xcode's bundled iPhoneOS 18.5 SDK
+# directly via `xcrun --sdk iphoneos --show-sdk-path`, rather than pulling a synthetic/
+# newer SDK from a third-party repo - this avoids compatibility landmines where Apple
+# has started removing headers (e.g. libkern/OSAtomic.h) from newer SDK snapshots.
 #
 # Trigger manually from the Actions tab (workflow_dispatch). All inputs have sane
 # defaults, so the first run can just hit "Run workflow" with nothing changed.
@@ -19,9 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       ios_sdk_version:
-        description: "SDK folder version from xybp888/iOS-SDKs, e.g. 26.5, 26.4, 18.5 (check the repo's file list for valid values)"
+        description: "Informational only - this workflow now uses the iPhoneOS SDK bundled with Xcode 16.4 (18.5), not a downloaded SDK. Kept for BUILD_INFO.txt labeling / future use."
         required: false
-        default: "26.5"
+        default: "18.5"
       ios_deployment_target:
         description: "Minimum iOS version the libraries will support"
         required: false
@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 180
 
     env:
-      IOS_SDK_VERSION: ${{ github.event.inputs.ios_sdk_version || '26.5' }}
+      IOS_SDK_VERSION: ${{ github.event.inputs.ios_sdk_version || '18.5' }}
       IOS_DEPLOYMENT_TARGET: ${{ github.event.inputs.ios_deployment_target || '13.0' }}
       PYTHON_BRANCH: ${{ github.event.inputs.python_branch || '3.12' }}
       SDL2_REF: ${{ github.event.inputs.sdl2_ref || 'master' }}
@@ -76,6 +76,17 @@ jobs:
           set -euo pipefail
           brew install cmake ninja
 
+      # --------------------------------------------------------------------
+      # Pin to Xcode 16.4 (bundled iPhoneOS SDK 18.5). This is GitHub's
+      # default Xcode on macos-latest at time of writing, and using the
+      # SDK Xcode actually ships avoids the landmines that come with
+      # sysroot-ing into a synthetic/very-new SDK pulled from a third-party
+      # repo (e.g. headers Apple has already started removing upstream,
+      # like libkern/OSAtomic.h in newer SDKs).
+      # --------------------------------------------------------------------
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app/Contents/Developer
+
       - name: Show toolchain versions
         run: |
           set -euo pipefail
@@ -92,25 +103,19 @@ jobs:
           echo "JOBS=$(sysctl -n hw.ncpu)" >> "$GITHUB_ENV"
 
       # --------------------------------------------------------------------
-      # Fetch the iOS SDK from xybp888/iOS-SDKs. We sparse-checkout just the
-      # one SDK folder we need instead of cloning the whole (huge) repo,
-      # since it contains every SDK version from iOS 9 through 26.x.
+      # Use the iPhoneOS SDK bundled with Xcode 16.4 (iOS 18.5) instead of
+      # pulling a synthetic SDK from a third-party repo. ios_sdk_version is
+      # no longer used for SDK selection now that we're on the real
+      # Xcode-bundled SDK, but the input is left in place in case you want
+      # to switch back to the xybp888/iOS-SDKs approach for a newer target
+      # later.
       # --------------------------------------------------------------------
-      - name: Download iOS SDK from xybp888/iOS-SDKs
+      - name: Resolve iOS SDK path
         run: |
           set -euo pipefail
-          SDK_FOLDER="iPhoneOS${IOS_SDK_VERSION}.sdk"
-          git clone --filter=blob:none --no-checkout --depth 1 \
-            --single-branch --branch master \
-            https://github.com/xybp888/iOS-SDKs.git "$SRC/iOS-SDKs"
-          cd "$SRC/iOS-SDKs"
-          git sparse-checkout init --cone
-          git sparse-checkout set "$SDK_FOLDER"
-          git checkout master
-          SDK_DIR="$SRC/iOS-SDKs/$SDK_FOLDER"
+          SDK_DIR="$(xcrun --sdk iphoneos --show-sdk-path)"
           if [ ! -d "$SDK_DIR/usr/include" ]; then
-            echo "::error::Could not find $SDK_FOLDER in xybp888/iOS-SDKs. Check the repo's"
-            echo "::error::file list for the exact folder name and set ios_sdk_version to match."
+            echo "::error::xcrun did not return a usable iphoneos SDK path: $SDK_DIR"
             exit 1
           fi
           echo "SDKROOT=$SDK_DIR" >> "$GITHUB_ENV"
@@ -118,9 +123,8 @@ jobs:
 
       # --------------------------------------------------------------------
       # A small CMake toolchain file that cross-compiles for iOS arm64
-      # (real devices) using the SDK we just downloaded. Apple's clang
-      # accepts an arbitrary -isysroot path, so it doesn't matter that this
-      # SDK isn't one Xcode itself knows about.
+      # (real devices) using the Xcode-bundled SDK resolved in the previous
+      # step. SDKROOT is read from the environment at configure time.
       #
       # We intentionally do NOT build our own zlib: iOS ships zlib as a
       # public system library (libz.tbd in the SDK), so everything below
@@ -292,53 +296,44 @@ jobs:
       # want to build vanilla upstream SDL2 with real tags instead, point
       # sdl2_ref/the clone URL at libsdl-org/SDL).
       #
-      # Two iOS/newer-SDK compatibility patches are applied to the freshly
-      # cloned source before configuring:
+      # One iOS compatibility patch is applied to the freshly cloned source
+      # before configuring:
       #
-      #   1. SDL_spinlock.c calls OSAtomicCompareAndSwap32Barrier(), which
-      #      lived in libkern/OSAtomic.h. Apple has fully removed that
-      #      header from newer iOS SDKs (confirmed gone in the 26.5 SDK this
-      #      workflow targets by default), causing an "undeclared function"
-      #      error. Fix: inject a drop-in replacement implemented with the
-      #      portable __sync_bool_compare_and_swap Clang/GCC builtin, which
-      #      doesn't depend on that header at all.
+      #   SDL_rwopsbundlesupport.m fails to compile under
+      #   -Werror=declaration-after-statement (which SDL's own
+      #   configure-derived EXTRA_CFLAGS adds unconditionally on Apple
+      #   targets). Passing -Wno-declaration-after-statement via
+      #   CMAKE_C_FLAGS does NOT win here: CMake places CMAKE_C_FLAGS
+      #   *before* each target's own EXTRA_CFLAGS on the compile line, and
+      #   Clang's "last flag wins" rule means SDL's own -Werror always
+      #   overrides it regardless of where the suppression flag is injected
+      #   from on the CMake side. The reliable fix is a per-file #pragma,
+      #   which applies after all command-line flags and isn't subject to
+      #   that ordering problem.
       #
-      #   2. SDL_rwopsbundlesupport.m fails to compile under
-      #      -Werror=declaration-after-statement (which SDL's own
-      #      configure-derived EXTRA_CFLAGS adds unconditionally on Apple
-      #      targets). Passing -Wno-declaration-after-statement via
-      #      CMAKE_C_FLAGS does NOT win here: CMake places CMAKE_C_FLAGS
-      #      *before* each target's own EXTRA_CFLAGS on the compile line,
-      #      and Clang's "last flag wins" rule means SDL's own -Werror
-      #      always overrides it regardless of where the suppression flag
-      #      is injected from on the CMake side. The reliable fix is a
-      #      per-file #pragma, which applies after all command-line flags
-      #      and isn't subject to that ordering problem.
+      # (An earlier version of this workflow also patched SDL_spinlock.c to
+      # replace OSAtomicCompareAndSwap32Barrier, since that symbol's header
+      # - libkern/OSAtomic.h - has been removed from newer/synthetic iOS
+      # SDKs. The real Xcode 16.4 / iPhoneOS 18.5 SDK used now still ships
+      # that header, so the patch isn't needed here. If you switch to a
+      # newer SDK and hit "call to undeclared function
+      # OSAtomicCompareAndSwap32Barrier" again, that patch can be reinstated.)
+      #
+      # SDL_OPENGL=OFF / SDL_OPENGLES=ON below are also required: SDL2's
+      # CMake renderer auto-detection was building the desktop OpenGL
+      # backend (SDL_render_gl.c / SDL_shaders_gl.c) even on this iOS
+      # target, which fails outright since iOS has never shipped desktop
+      # OpenGL (GLuint, GLhandleARB, PFNGL...ARBPROC etc. don't exist in the
+      # iOS SDK - only OpenGL ES does). Disabling SDL_OPENGL explicitly
+      # stops those two files from being compiled at all, leaving the
+      # OpenGL ES2 backend (SDL_render_gles2.c), which already builds fine.
       # --------------------------------------------------------------------
       - name: Build SDL2
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$SDL2_REF" https://github.com/renpy/SDL2.git "$SRC/SDL2"
 
-          # --- Patch 1: SDL_spinlock.c / OSAtomicCompareAndSwap32Barrier ---
-          cat > "$SRC/SDL2/src/atomic/sdl2_ios26_osatomic_compat.h" << 'EOF'
-          #ifndef SDL2_IOS26_OSATOMIC_COMPAT_H
-          #define SDL2_IOS26_OSATOMIC_COMPAT_H
-          #if defined(__APPLE__) && !defined(SDL2_IOS26_OSATOMIC_COMPAT_DISABLE)
-          static __inline__ int OSAtomicCompareAndSwap32Barrier(int oldValue, int newValue, volatile int *theValue) {
-              return __sync_bool_compare_and_swap(theValue, oldValue, newValue);
-          }
-          #endif
-          #endif
-          EOF
-          SPINLOCK_C="$SRC/SDL2/src/atomic/SDL_spinlock.c"
-          if ! grep -q sdl2_ios26_osatomic_compat.h "$SPINLOCK_C"; then
-            sed -i '' '1i\
-          #include "sdl2_ios26_osatomic_compat.h"
-          ' "$SPINLOCK_C"
-          fi
-
-          # --- Patch 2: SDL_rwopsbundlesupport.m / declaration-after-statement ---
+          # --- Patch: SDL_rwopsbundlesupport.m / declaration-after-statement ---
           RWOPS_M="$SRC/SDL2/src/file/cocoa/SDL_rwopsbundlesupport.m"
           if [ -f "$RWOPS_M" ]; then
             echo "--- SDL_rwopsbundlesupport.m before patch ---"
@@ -359,7 +354,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF
+            -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF \
+            -DSDL_OPENGL=OFF -DSDL_OPENGLES=ON
           cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2-build"
 
@@ -458,7 +454,7 @@ jobs:
           cat > "$OUT/BUILD_INFO.txt" << INFO
           Ren'Py iOS toolchain
           Built: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          iOS SDK: $IOS_SDK_VERSION (from xybp888/iOS-SDKs)
+          iOS SDK: $IOS_SDK_VERSION (Xcode-bundled, via xcrun --sdk iphoneos --show-sdk-path)
           Deployment target: iOS $IOS_DEPLOYMENT_TARGET, arm64 device only
           SDL2: renpy/SDL2 @ $SDL2_REF
           SDL2_image: libsdl-org/SDL_image @ $SDL2_IMAGE_REF
