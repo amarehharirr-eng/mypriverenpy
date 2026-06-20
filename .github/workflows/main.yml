@@ -45,7 +45,7 @@ on:
       sdl2_mixer_ref:
         description: "Git tag of libsdl-org/SDL_mixer to build"
         required: false
-        default: "release-2.8.0"
+        default: "master"
 
 jobs:
   build:
