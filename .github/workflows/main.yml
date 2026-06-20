@@ -287,6 +287,9 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$SDL2_REF" https://github.com/renpy/SDL2.git "$SRC/SDL2"
+
+          # SDL_spinlock.c: provide OSAtomicCompareAndSwap32Barrier via a
+          # Clang builtin, since newer iOS SDKs removed libkern/OSAtomic.h.
           cat > "$SRC/SDL2/src/atomic/sdl2_ios26_osatomic_compat.h" << 'EOF'
           #ifndef SDL2_IOS26_OSATOMIC_COMPAT_H
           #define SDL2_IOS26_OSATOMIC_COMPAT_H
@@ -297,7 +300,6 @@ jobs:
           #endif
           #endif
           EOF
-
           SPINLOCK_C="$SRC/SDL2/src/atomic/SDL_spinlock.c"
           if ! grep -q sdl2_ios26_osatomic_compat.h "$SPINLOCK_C"; then
             sed -i '' '1i\
@@ -305,30 +307,26 @@ jobs:
           ' "$SPINLOCK_C"
           fi
 
+          # SDL_rwopsbundlesupport.m: SDL's own -Werror=declaration-after-statement
+          # always wins over any CMAKE_C_FLAGS suppression attempt (CMake puts
+          # CMAKE_C_FLAGS before each target's EXTRA_CFLAGS), so patch the line.
+          RWOPS_M="$SRC/SDL2/src/file/cocoa/SDL_rwopsbundlesupport.m"
+          if [ -f "$RWOPS_M" ]; then
+            sed -i '' \
+              -e 's/NSFileManager\* file_manager = \[NSFileManager defaultManager\];/NSFileManager* file_manager;\n    file_manager = [NSFileManager defaultManager];/' \
+              "$RWOPS_M"
+            echo "Patched SDL_rwopsbundlesupport.m, context:"
+            grep -n -A2 -B2 "file_manager" "$RWOPS_M"
+          fi
+
           cmake -S "$SRC/SDL2" -B "$SRC/SDL2-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DCMAKE_C_FLAGS="-Wno-declaration-after-statement" \
             -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST=OFF
           cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2-build"
-
-      - name: Build SDL2_image
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch "$SDL2_IMAGE_REF" https://github.com/libsdl-org/SDL_image.git "$SRC/SDL2_image"
-          cmake -S "$SRC/SDL2_image" -B "$SRC/SDL2_image-build" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-            -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
-            -DBUILD_SHARED_LIBS=OFF -DSDL2IMAGE_VENDORED=OFF -DSDL2IMAGE_SAMPLES=OFF \
-            -DSDL2IMAGE_AVIF=OFF -DSDL2IMAGE_JXL=OFF -DSDL2IMAGE_TIF=OFF
-          cmake --build "$SRC/SDL2_image-build" --parallel "$JOBS"
-          cmake --install "$SRC/SDL2_image-build"
 
       - name: Build SDL2_ttf
         run: |
