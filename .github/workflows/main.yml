@@ -383,7 +383,8 @@ jobs:
       - name: Build SDL2_mixer
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
