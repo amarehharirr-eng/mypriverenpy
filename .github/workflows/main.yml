@@ -386,11 +386,13 @@ jobs:
       - name: Build SDL2_mixer
         run: |
           set -euo pipefail
-          git clone --depth 1 --recurse-submodules --shallow-submodules \
-            --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
 
-          # Force every vendored subproject to build static.
-          # CACHE FORCE wins over any option() call inside the subproject.
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch "$SDL2_MIXER_REF" \
+            https://github.com/libsdl-org/SDL_mixer.git \
+            "$SRC/SDL2_mixer"
+
+          # Force vendored libraries static
           find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" | while read f; do
             printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
               cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
@@ -411,7 +413,8 @@ jobs:
             -DSDL2MIXER_WAVPACK=OFF \
             -DSDL2MIXER_FLAC=ON \
             -DSDL2MIXER_MP3=ON \
-            -DSDL2MIXER_VORBIS=VORBISFILE
+            -DSDL2MIXER_VORBIS=STB
+
           cmake --build "$SRC/SDL2_mixer-build" -- -j "$JOBS"
           cmake --install "$SRC/SDL2_mixer-build"
 
