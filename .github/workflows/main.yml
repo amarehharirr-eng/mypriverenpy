@@ -75,6 +75,11 @@ jobs:
         run: |
           set -euo pipefail
           brew install cmake ninja
+          # Prepend the brew bin directory so the brew-installed cmake takes
+          # priority over the older Xcode-shim cmake on PATH. Without this,
+          # macOS runners resolve cmake to the Xcode shim, which predates
+          # --parallel and treats it as an unknown argument.
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
       # --------------------------------------------------------------------
       # Pin to Xcode 16.4 (bundled iPhoneOS SDK 18.5). This is GitHub's
@@ -195,7 +200,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
             -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_TESTS=OFF -DPNG_TOOLS=OFF
-          cmake --build libpng-build --parallel "$JOBS"
+          cmake --build libpng-build -- -j "$JOBS"
           cmake --install libpng-build
 
       # --------------------------------------------------------------------
@@ -214,7 +219,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
             -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DWITH_SIMD=OFF
-          cmake --build libjpeg-turbo-build --parallel "$JOBS"
+          cmake --build libjpeg-turbo-build -- -j "$JOBS"
           cmake --install libjpeg-turbo-build
 
       # --------------------------------------------------------------------
@@ -234,7 +239,7 @@ jobs:
             -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
             -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
             -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF
-          cmake --build libwebp-build --parallel "$JOBS"
+          cmake --build libwebp-build -- -j "$JOBS"
           cmake --install libwebp-build
 
       # --------------------------------------------------------------------
@@ -254,7 +259,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
             -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON -DFT_DISABLE_BZIP2=ON
-          cmake --build freetype-build --parallel "$JOBS"
+          cmake --build freetype-build -- -j "$JOBS"
           cmake --install freetype-build
 
       # --------------------------------------------------------------------
@@ -315,7 +320,7 @@ jobs:
             -DSDL_OPENGL=OFF \
             -DSDL_OPENGLES=ON
 
-          cmake --build "$SRC/SDL2-build" --parallel "$JOBS"
+          cmake --build "$SRC/SDL2-build" -- -j "$JOBS"
           cmake --install "$SRC/SDL2-build"
 
       - name: Build SDL2_image
@@ -330,7 +335,7 @@ jobs:
             -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
             -DBUILD_SHARED_LIBS=OFF -DSDL2IMAGE_VENDORED=OFF -DSDL2IMAGE_SAMPLES=OFF \
             -DSDL2IMAGE_AVIF=OFF -DSDL2IMAGE_JXL=OFF -DSDL2IMAGE_TIF=OFF
-          cmake --build "$SRC/SDL2_image-build" --parallel "$JOBS"
+          cmake --build "$SRC/SDL2_image-build" -- -j "$JOBS"
           cmake --install "$SRC/SDL2_image-build"
 
       - name: Build SDL2_ttf
@@ -344,40 +349,39 @@ jobs:
             -DCMAKE_PREFIX_PATH="$PREFIX" \
             -DSDL2_DIR="$PREFIX/lib/cmake/SDL2" \
             -DBUILD_SHARED_LIBS=OFF -DSDL2TTF_VENDORED=OFF -DSDL2TTF_HARFBUZZ=OFF -DSDL2TTF_SAMPLES=OFF
-          cmake --build "$SRC/SDL2_ttf-build" --parallel "$JOBS"
+          cmake --build "$SRC/SDL2_ttf-build" -- -j "$JOBS"
           cmake --install "$SRC/SDL2_ttf-build"
 
       # --------------------------------------------------------------------
       # SDL2_mixer with vendored ogg/vorbis/flac/mpg123.
       #
-      # SDL2MIXER_VORBIS has three modes:
-      #   VORBISFILE - runtime dlopen() of libvorbisfile.dylib. SDL2_mixer's
-      #                CMake calls target_get_dynamic_library() to resolve the
-      #                .dylib name, which hard-errors if the target is STATIC.
-      #                Cannot be used for a fully static iOS build.
-      #   TREMOR     - integer-only vorbis decoder (libvorbisidec). Not in
-      #                the vendored submodules, requires a separate source.
-      #   VORBIS     - links libvorbis/libvorbisfile directly as static libs
-      #                at build time. This is the correct mode for static
-      #                builds. target_get_dynamic_library is NOT called in
-      #                this path.
+      # SDL2MIXER_VORBIS valid values in release-2.8.0 are:
+      #   STB        - built-in stb_vorbis decoder, no external deps.
+      #   TREMOR     - integer-only decoder (libvorbisidec), not in the
+      #                vendored submodules, requires a separate source.
+      #   VORBISFILE - links vendored libvorbis/libvorbisfile as static
+      #                archives at build time when combined with
+      #                SDL2MIXER_VENDORED=ON. This is the correct mode
+      #                for a fully static iOS build using the bundled
+      #                submodules.
       #
-      # We use VORBIS mode. The libogg and libvorbis build steps that were
-      # previously in this workflow are removed: with VENDORED=ON the mixer
-      # builds its own copies of ogg and vorbis from the cloned submodules.
+      # We use VORBISFILE + VENDORED=ON. The BUILD_SHARED_LIBS CACHE FORCE
+      # patch applied to every vendored CMakeLists.txt below ensures ogg
+      # and vorbis build as static archives inside the subproject scope,
+      # overriding their own option(BUILD_SHARED_LIBS ... ON) defaults.
       #
-      # Two source patches are still required before configure:
+      # Two source patches are required before configure:
       #
-      # 1. Prepend SET(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE) to every
-      #    vendored CMakeLists.txt. Without this, ogg/vorbis/flac/mpg123 each
-      #    have their own option(BUILD_SHARED_LIBS ... ON) that re-enables
-      #    shared libs inside the subproject scope, overriding the parent's
+      # 1. Prepend set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE) to every
+      #    vendored CMakeLists.txt. Without this, ogg/vorbis/flac/mpg123
+      #    each have their own option() that re-enables shared libs inside
+      #    the subproject scope, overriding the parent's
       #    -DBUILD_SHARED_LIBS=OFF. CACHE FORCE beats option().
       #
       # 2. Disable wavpack (-DSDL2MIXER_WAVPACK=OFF). Wavpack's CMake uses
-      #    TARGET_SONAME_FILE_NAME which is only valid for SHARED targets and
-      #    hard-errors on iOS even when built static. Ren'Py does not use
-      #    .wv audio files so there is no functional loss.
+      #    TARGET_SONAME_FILE_NAME which is only valid for SHARED targets
+      #    and hard-errors on iOS even when built static. Ren'Py does not
+      #    use .wv audio files so there is no functional loss.
       # --------------------------------------------------------------------
       - name: Build SDL2_mixer
         run: |
@@ -407,8 +411,8 @@ jobs:
             -DSDL2MIXER_WAVPACK=OFF \
             -DSDL2MIXER_FLAC=ON \
             -DSDL2MIXER_MP3=ON \
-            -DSDL2MIXER_VORBIS=VORBISFILE \
-          cmake --build "$SRC/SDL2_mixer-build" --parallel "$JOBS"
+            -DSDL2MIXER_VORBIS=VORBISFILE
+          cmake --build "$SRC/SDL2_mixer-build" -- -j "$JOBS"
           cmake --install "$SRC/SDL2_mixer-build"
 
       # --------------------------------------------------------------------
