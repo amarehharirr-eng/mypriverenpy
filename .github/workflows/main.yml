@@ -407,7 +407,7 @@ jobs:
             -DSDL2MIXER_WAVPACK=OFF \
             -DSDL2MIXER_FLAC=ON \
             -DSDL2MIXER_MP3=ON \
-            -DSDL2MIXER_VORBIS=VORBIS
+            -DSDL2MIXER_VORBIS=VORBISFILE \
           cmake --build "$SRC/SDL2_mixer-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2_mixer-build"
 
