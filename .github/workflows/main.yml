@@ -386,11 +386,32 @@ jobs:
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
 
-          # Patch vendored vorbis and ogg CMakeLists to force static, no shared libs.
-          # Without this, the vendored builds ignore BUILD_SHARED_LIBS=OFF and try
-          # to produce .dylibs which fail to link on iOS (no dynamic linking allowed).
-          find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" \
-            -exec sed -i '' 's/add_library(\([^ ]*\) SHARED/add_library(\1 STATIC/g' {} +
+          # The vendored ogg and vorbis CMakeLists both call:
+          #   option(BUILD_SHARED_LIBS "..." ON)
+          # which resets BUILD_SHARED_LIBS to ON inside the subproject scope,
+          # overriding the -DBUILD_SHARED_LIBS=OFF we pass from the parent.
+          # Patch each one to default OFF instead.
+          for f in \
+            "$SRC/SDL2_mixer/external/ogg/CMakeLists.txt" \
+            "$SRC/SDL2_mixer/external/vorbis/CMakeLists.txt" \
+            "$SRC/SDL2_mixer/external/flac/CMakeLists.txt" \
+            "$SRC/SDL2_mixer/external/mpg123/CMakeLists.txt"; do
+            [ -f "$f" ] && \
+              sed -i '' 's/option(BUILD_SHARED_LIBS[^)]*"[^"]*"[^)]*ON)/option(BUILD_SHARED_LIBS "" OFF)/g' "$f" || true
+          done
+
+          # Harder fallback: prepend a cmake_minimum_required + set() to each
+          # vendored CMakeLists so BUILD_SHARED_LIBS is forced OFF even if the
+          # option() call above didn't match the exact format in this version.
+          for f in \
+            "$SRC/SDL2_mixer/external/ogg/CMakeLists.txt" \
+            "$SRC/SDL2_mixer/external/vorbis/CMakeLists.txt"; do
+            if [ -f "$f" ]; then
+              echo "Prepending BUILD_SHARED_LIBS=OFF override to $f"
+              printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
+                cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
+            fi
+          done
 
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
