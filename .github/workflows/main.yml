@@ -385,6 +385,13 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
+
+          # Patch vendored vorbis and ogg CMakeLists to force static, no shared libs.
+          # Without this, the vendored builds ignore BUILD_SHARED_LIBS=OFF and try
+          # to produce .dylibs which fail to link on iOS (no dynamic linking allowed).
+          find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" \
+            -exec sed -i '' 's/add_library(\([^ ]*\) SHARED/add_library(\1 STATIC/g' {} +
+
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
