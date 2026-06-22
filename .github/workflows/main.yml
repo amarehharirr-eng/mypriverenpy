@@ -258,39 +258,6 @@ jobs:
           cmake --install freetype-build
 
       # --------------------------------------------------------------------
-      # libogg + libvorbis (needed by SDL2_mixer for .ogg playback)
-      # --------------------------------------------------------------------
-      - name: Build libogg
-        run: |
-          set -euo pipefail
-          cd "$SRC"
-          curl -fL -o libogg.tar.gz "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.gz"
-          mkdir -p libogg-src && tar xzf libogg.tar.gz -C libogg-src --strip-components=1
-          cmake -S libogg-src -B libogg-build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-            -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DBUILD_TESTING=OFF
-          cmake --build libogg-build --parallel "$JOBS"
-          cmake --install libogg-build
-
-      - name: Build libvorbis
-        run: |
-          set -euo pipefail
-          cd "$SRC"
-          curl -fL -o libvorbis.tar.gz "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.gz"
-          mkdir -p libvorbis-src && tar xzf libvorbis.tar.gz -C libvorbis-src --strip-components=1
-          cmake -S libvorbis-src -B libvorbis-build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-            -DCMAKE_PREFIX_PATH="$PREFIX" \
-            -DOGG_INCLUDE_DIR="$PREFIX/include" -DOGG_LIBRARY="$PREFIX/lib/libogg.a"
-          cmake --build libvorbis-build --parallel "$JOBS"
-          cmake --install libvorbis-build
-
-      # --------------------------------------------------------------------
       # SDL2 itself. Source defaults to Ren'Py's own SDL2 fork, which only
       # has a "master" branch (no release tags exist on this fork - if you
       # want to build vanilla upstream SDL2 with real tags instead, point
@@ -380,26 +347,50 @@ jobs:
           cmake --build "$SRC/SDL2_ttf-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2_ttf-build"
 
+      # --------------------------------------------------------------------
+      # SDL2_mixer with vendored ogg/vorbis/flac/mpg123.
+      #
+      # SDL2MIXER_VORBIS has three modes:
+      #   VORBISFILE - runtime dlopen() of libvorbisfile.dylib. SDL2_mixer's
+      #                CMake calls target_get_dynamic_library() to resolve the
+      #                .dylib name, which hard-errors if the target is STATIC.
+      #                Cannot be used for a fully static iOS build.
+      #   TREMOR     - integer-only vorbis decoder (libvorbisidec). Not in
+      #                the vendored submodules, requires a separate source.
+      #   VORBIS     - links libvorbis/libvorbisfile directly as static libs
+      #                at build time. This is the correct mode for static
+      #                builds. target_get_dynamic_library is NOT called in
+      #                this path.
+      #
+      # We use VORBIS mode. The libogg and libvorbis build steps that were
+      # previously in this workflow are removed: with VENDORED=ON the mixer
+      # builds its own copies of ogg and vorbis from the cloned submodules.
+      #
+      # Two source patches are still required before configure:
+      #
+      # 1. Prepend SET(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE) to every
+      #    vendored CMakeLists.txt. Without this, ogg/vorbis/flac/mpg123 each
+      #    have their own option(BUILD_SHARED_LIBS ... ON) that re-enables
+      #    shared libs inside the subproject scope, overriding the parent's
+      #    -DBUILD_SHARED_LIBS=OFF. CACHE FORCE beats option().
+      #
+      # 2. Disable wavpack (-DSDL2MIXER_WAVPACK=OFF). Wavpack's CMake uses
+      #    TARGET_SONAME_FILE_NAME which is only valid for SHARED targets and
+      #    hard-errors on iOS even when built static. Ren'Py does not use
+      #    .wv audio files so there is no functional loss.
+      # --------------------------------------------------------------------
       - name: Build SDL2_mixer
         run: |
           set -euo pipefail
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
 
-          # Force all vendored subprojects to build static, not shared.
+          # Force every vendored subproject to build static.
+          # CACHE FORCE wins over any option() call inside the subproject.
           find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" | while read f; do
             printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
               cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
           done
-
-          # SDL2_mixer's PrivateSdlFunctions.cmake:target_get_dynamic_library
-          # hard-errors when the vorbisfile target is STATIC_LIBRARY.
-          # The function is only used to locate the .dylib for runtime loading,
-          # which we don't need for a static iOS build. Replace the fatal error
-          # with a no-op so configure succeeds.
-          sed -i '' \
-            's/message(FATAL_ERROR.*is not a shared library.*)/message(STATUS "Skipping dynamic library check for static build")/g' \
-            "$SRC/SDL2_mixer/cmake/PrivateSdlFunctions.cmake"
 
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
@@ -416,7 +407,7 @@ jobs:
             -DSDL2MIXER_WAVPACK=OFF \
             -DSDL2MIXER_FLAC=ON \
             -DSDL2MIXER_MP3=ON \
-            -DSDL2MIXER_VORBIS=VORBISFILE
+            -DSDL2MIXER_VORBIS=VORBIS
           cmake --build "$SRC/SDL2_mixer-build" --parallel "$JOBS"
           cmake --install "$SRC/SDL2_mixer-build"
 
