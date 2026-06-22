@@ -386,32 +386,26 @@ jobs:
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
 
-          # The vendored ogg and vorbis CMakeLists both call:
-          #   option(BUILD_SHARED_LIBS "..." ON)
-          # which resets BUILD_SHARED_LIBS to ON inside the subproject scope,
-          # overriding the -DBUILD_SHARED_LIBS=OFF we pass from the parent.
-          # Patch each one to default OFF instead.
-          for f in \
-            "$SRC/SDL2_mixer/external/ogg/CMakeLists.txt" \
-            "$SRC/SDL2_mixer/external/vorbis/CMakeLists.txt" \
-            "$SRC/SDL2_mixer/external/flac/CMakeLists.txt" \
-            "$SRC/SDL2_mixer/external/mpg123/CMakeLists.txt"; do
-            [ -f "$f" ] && \
-              sed -i '' 's/option(BUILD_SHARED_LIBS[^)]*"[^"]*"[^)]*ON)/option(BUILD_SHARED_LIBS "" OFF)/g' "$f" || true
+          # Prepend BUILD_SHARED_LIBS=OFF FORCE to every vendored subproject
+          # CMakeLists.txt so no subproject can re-enable shared libs via
+          # option() or project-local logic. CACHE FORCE wins over option().
+          find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" | while read f; do
+            printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
+              cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
           done
 
-          # Harder fallback: prepend a cmake_minimum_required + set() to each
-          # vendored CMakeLists so BUILD_SHARED_LIBS is forced OFF even if the
-          # option() call above didn't match the exact format in this version.
-          for f in \
-            "$SRC/SDL2_mixer/external/ogg/CMakeLists.txt" \
-            "$SRC/SDL2_mixer/external/vorbis/CMakeLists.txt"; do
-            if [ -f "$f" ]; then
-              echo "Prepending BUILD_SHARED_LIBS=OFF override to $f"
-              printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
-                cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
-            fi
-          done
+          # wavpack's CMake uses TARGET_SONAME_FILE_NAME which is only valid
+          # for shared library targets - it hard-errors on iOS even when the
+          # target ends up static. Disable wavpack (SDL2_mixer uses it only
+          # for .wv files, which Ren'Py doesn't need).
+          sed -i '' 's/set(SDL2MIXER_WAVPACK_SHARED[^)]*)/set(SDL2MIXER_WAVPACK_SHARED OFF)/g' \
+            "$SRC/SDL2_mixer/CMakeLists.txt" || true
+          # Also patch wavpack's own CMakeLists to hard-disable the soname logic
+          if [ -f "$SRC/SDL2_mixer/external/wavpack/CMakeLists.txt" ]; then
+            sed -i '' \
+              's/message.*TARGET_SONAME_FILE_NAME.*//g' \
+              "$SRC/SDL2_mixer/external/wavpack/CMakeLists.txt" || true
+          fi
 
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
@@ -425,6 +419,7 @@ jobs:
             -DSDL2MIXER_MOD=OFF \
             -DSDL2MIXER_MIDI=OFF \
             -DSDL2MIXER_OPUS=OFF \
+            -DSDL2MIXER_WAVPACK=OFF \
             -DSDL2MIXER_FLAC=ON \
             -DSDL2MIXER_MP3=ON \
             -DSDL2MIXER_VORBIS=VORBISFILE
