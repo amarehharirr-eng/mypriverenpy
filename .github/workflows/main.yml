@@ -386,26 +386,20 @@ jobs:
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             --branch "$SDL2_MIXER_REF" https://github.com/libsdl-org/SDL_mixer.git "$SRC/SDL2_mixer"
 
-          # Prepend BUILD_SHARED_LIBS=OFF FORCE to every vendored subproject
-          # CMakeLists.txt so no subproject can re-enable shared libs via
-          # option() or project-local logic. CACHE FORCE wins over option().
+          # Force all vendored subprojects to build static, not shared.
           find "$SRC/SDL2_mixer/external" -name "CMakeLists.txt" | while read f; do
             printf 'set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)\n' | \
               cat - "$f" > "$f.patched" && mv "$f.patched" "$f"
           done
 
-          # wavpack's CMake uses TARGET_SONAME_FILE_NAME which is only valid
-          # for shared library targets - it hard-errors on iOS even when the
-          # target ends up static. Disable wavpack (SDL2_mixer uses it only
-          # for .wv files, which Ren'Py doesn't need).
-          sed -i '' 's/set(SDL2MIXER_WAVPACK_SHARED[^)]*)/set(SDL2MIXER_WAVPACK_SHARED OFF)/g' \
-            "$SRC/SDL2_mixer/CMakeLists.txt" || true
-          # Also patch wavpack's own CMakeLists to hard-disable the soname logic
-          if [ -f "$SRC/SDL2_mixer/external/wavpack/CMakeLists.txt" ]; then
-            sed -i '' \
-              's/message.*TARGET_SONAME_FILE_NAME.*//g' \
-              "$SRC/SDL2_mixer/external/wavpack/CMakeLists.txt" || true
-          fi
+          # SDL2_mixer's PrivateSdlFunctions.cmake:target_get_dynamic_library
+          # hard-errors when the vorbisfile target is STATIC_LIBRARY.
+          # The function is only used to locate the .dylib for runtime loading,
+          # which we don't need for a static iOS build. Replace the fatal error
+          # with a no-op so configure succeeds.
+          sed -i '' \
+            's/message(FATAL_ERROR.*is not a shared library.*)/message(STATUS "Skipping dynamic library check for static build")/g' \
+            "$SRC/SDL2_mixer/cmake/PrivateSdlFunctions.cmake"
 
           cmake -S "$SRC/SDL2_mixer" -B "$SRC/SDL2_mixer-build" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/ios.toolchain.cmake" \
